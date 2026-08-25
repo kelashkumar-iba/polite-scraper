@@ -14,21 +14,46 @@ from pydantic import BaseModel, HttpUrl, ValidationError
 USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/kelashkumar-iba/polite-scraper)"
 TIMEOUT_SECONDS = 10
 DELAY_SECONDS = 0.5
+RETRY_DELAY_SECONDS = 2
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "cache")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output")
 
 BASE_CATALOGUE_URL = "https://books.toscrape.com/catalogue/page-1.html"
 MAX_CATALOGUE_PAGES = 3
 
+# Set this to True to deliberately add one fake book URL to the list, to
+# prove the scraper survives a broken page without crashing (Stage 5
+# checkpoint). Leave False for a normal, real run.
+INJECT_FAKE_URL_FOR_TESTING = True
+
 STAR_WORDS = {"Zero", "One", "Two", "Three", "Four", "Five"}
 STAR_WORD_TO_NUMBER = {"Zero": 0, "One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5}
 
 
+class FetchFailure(Exception):
+    """Raised when a page could not be fetched after retries. Carries the
+    reason so the run report and error log can explain what happened."""
+    def __init__(self, url, reason):
+        self.url = url
+        self.reason = reason
+        super().__init__(f"{url}: {reason}")
+
+
 # ---------------------------------------------------------------------------
-# Fetch + cache (unchanged from Stage 3)
+# Fetch + cache, now with a retry rule.
 # ---------------------------------------------------------------------------
 
-def fetch_page(url: str, cache_filename: str) -> str:
+def fetch_page(url: str, cache_filename: str) -> tuple[str, bool]:
+    """
+    Returns (html, was_cached). Raises FetchFailure if the page could not
+    be retrieved.
+
+    Retry rule: a timeout or a 5xx server error is retried once, after a
+    short wait -- the server might just be having a bad moment. A 404
+    (page doesn't exist) or 403 (site said no) is NOT retried -- asking
+    again won't create a missing page, and hammering a page that said "no"
+    is how a polite robot becomes a pest.
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, cache_filename)
 
@@ -36,23 +61,52 @@ def fetch_page(url: str, cache_filename: str) -> str:
         with open(cache_path, "r", encoding="utf-8") as f:
             html = f.read()
         print(f"CACHE HIT  {cache_filename}  ({len(html)} bytes)")
-        return html
+        return html, True
 
     headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
-    response.raise_for_status()
+    attempts = 0
+    max_attempts = 2
 
-    html = response.text
-    with open(cache_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    while attempts < max_attempts:
+        attempts += 1
+        try:
+            response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+        except requests.exceptions.Timeout:
+            if attempts < max_attempts:
+                print(f"RETRY      {cache_filename}  (timeout, attempt {attempts})")
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise FetchFailure(url, "timeout after retry")
+        except requests.exceptions.RequestException as e:
+            raise FetchFailure(url, f"request error: {e}")
 
-    print(f"FETCH      {cache_filename}  ({len(html)} bytes)  status={response.status_code}")
-    time.sleep(DELAY_SECONDS)
-    return html
+        if response.status_code == 200:
+            html = response.text
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            print(f"FETCH      {cache_filename}  ({len(html)} bytes)  status=200")
+            time.sleep(DELAY_SECONDS)
+            return html, False
+
+        if response.status_code in (404, 403):
+            # Do not retry -- asking again won't help either of these.
+            raise FetchFailure(url, f"status {response.status_code}, not retrying")
+
+        if 500 <= response.status_code < 600:
+            if attempts < max_attempts:
+                print(f"RETRY      {cache_filename}  (status {response.status_code}, attempt {attempts})")
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise FetchFailure(url, f"status {response.status_code} after retry")
+
+        # Any other unexpected status -- treat as a non-retryable failure.
+        raise FetchFailure(url, f"unexpected status {response.status_code}")
+
+    raise FetchFailure(url, "exhausted retries")
 
 
 # ---------------------------------------------------------------------------
-# Discovery (unchanged from Stage 3)
+# Discovery
 # ---------------------------------------------------------------------------
 
 def get_book_links(html: str, page_url: str) -> list[str]:
@@ -80,7 +134,7 @@ def discover_all_book_links() -> list[tuple[str, str]]:
 
     while current_url and page_number <= MAX_CATALOGUE_PAGES:
         cache_filename = f"catalogue-page-{page_number}.html"
-        html = fetch_page(current_url, cache_filename)
+        html, _ = fetch_page(current_url, cache_filename)
         for link in get_book_links(html, current_url):
             all_pairs.append((link, current_url))
         current_url = get_next_page_url(html, current_url)
@@ -90,7 +144,14 @@ def discover_all_book_links() -> list[tuple[str, str]]:
     for link, source in all_pairs:
         if link not in seen:
             seen[link] = source
-    return list(seen.items())
+    pairs = list(seen.items())
+
+    if INJECT_FAKE_URL_FOR_TESTING:
+        fake_url = "https://books.toscrape.com/catalogue/this-book-does-not-exist_9999/index.html"
+        pairs.append((fake_url, BASE_CATALOGUE_URL))
+        print(f"[testing] injected fake URL: {fake_url}")
+
+    return pairs
 
 
 def cache_filename_for_book(product_url: str) -> str:
@@ -100,7 +161,7 @@ def cache_filename_for_book(product_url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Raw extraction (unchanged from Stage 3)
+# Raw extraction
 # ---------------------------------------------------------------------------
 
 def extract_book_record(html: str, product_url: str, source_page: str) -> dict:
@@ -154,15 +215,12 @@ def extract_book_record(html: str, product_url: str, source_page: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: normalize raw text into clean values
+# Normalize
 # ---------------------------------------------------------------------------
 
 def parse_price_gbp(price_text: str | None) -> float | None:
-    """'£51.77' -> 51.77. Strips the currency symbol and any stray
-    whitespace/encoding artifacts, then parses the number."""
     if not price_text:
         return None
-    # Keep only digits and the decimal point.
     cleaned = re.sub(r"[^\d.]", "", price_text)
     if not cleaned:
         return None
@@ -178,10 +236,6 @@ def parse_rating_number(rating_text: str | None) -> int | None:
     return STAR_WORD_TO_NUMBER.get(rating_text)
 
 
-# ---------------------------------------------------------------------------
-# Schema -- the shape of a finished, storable record.
-# ---------------------------------------------------------------------------
-
 class Book(BaseModel):
     title: str
     product_url: HttpUrl
@@ -196,9 +250,6 @@ class Book(BaseModel):
 
 
 def normalize_record(raw: dict) -> dict:
-    """Takes a raw extracted record and returns a dict with the clean
-    fields added alongside the original raw text -- both live side by
-    side, nothing is thrown away."""
     return {
         **raw,
         "price_gbp": parse_price_gbp(raw.get("price_text")),
@@ -207,27 +258,74 @@ def normalize_record(raw: dict) -> dict:
 
 
 def main():
-    link_pairs = discover_all_book_links()
-    urls_only = [url for url, _ in link_pairs]
-    print(f"catalogue_pages={min(MAX_CATALOGUE_PAGES, 3)}")
-    print(f"discovered={len(urls_only)}")
-    print(f"unique_urls={len(set(urls_only))}")
+    run_started_at = datetime.now(timezone.utc)
 
+    cache_hits = 0
+    pages_fetched = 0
+    failed_pages = []
+
+    def fetch_and_count(url, cache_filename):
+        nonlocal cache_hits, pages_fetched
+        html, was_cached = fetch_page(url, cache_filename)
+        if was_cached:
+            cache_hits += 1
+        else:
+            pages_fetched += 1
+        return html
+
+    # --- Discovery, with per-page failure isolation -----------------------
+    all_pairs = []
+    current_url = BASE_CATALOGUE_URL
+    page_number = 1
+
+    while current_url and page_number <= MAX_CATALOGUE_PAGES:
+        cache_filename = f"catalogue-page-{page_number}.html"
+        try:
+            html = fetch_and_count(current_url, cache_filename)
+        except FetchFailure as e:
+            print(f"FAILED     {cache_filename}  ({e.reason})")
+            failed_pages.append({"url": e.url, "reason": e.reason})
+            break  # a broken catalogue page means we can't find "next" either
+        for link in get_book_links(html, current_url):
+            all_pairs.append((link, current_url))
+        current_url = get_next_page_url(html, current_url)
+        page_number += 1
+
+    seen = {}
+    for link, source in all_pairs:
+        if link not in seen:
+            seen[link] = source
+    link_pairs = list(seen.items())
+
+    if INJECT_FAKE_URL_FOR_TESTING:
+        fake_url = "https://books.toscrape.com/catalogue/this-book-does-not-exist_9999/index.html"
+        link_pairs.append((fake_url, BASE_CATALOGUE_URL))
+        print(f"[testing] injected fake URL: {fake_url}")
+
+    print(f"catalogue_pages={min(MAX_CATALOGUE_PAGES, 3)}")
+    print(f"discovered={len(link_pairs)}")
+    print(f"unique_urls={len(set(u for u, _ in link_pairs))}")
+
+    # --- Detail pages, each handled separately so one bad page never
+    #     takes down the rest of the run --------------------------------
     valid_books = []
     invalid_records = []
     seen_canonical_urls = set()
 
     for product_url, source_page in link_pairs:
-        # product_url is already the canonical identity of this record --
-        # skip if we've somehow already processed it (shouldn't happen
-        # given discover_all_book_links() already de-duplicates, but this
-        # is the belt-and-suspenders check that guarantees idempotency).
         if product_url in seen_canonical_urls:
             continue
         seen_canonical_urls.add(product_url)
 
         cache_filename = cache_filename_for_book(product_url)
-        html = fetch_page(product_url, cache_filename)
+
+        try:
+            html = fetch_and_count(product_url, cache_filename)
+        except FetchFailure as e:
+            print(f"FAILED     {cache_filename}  ({e.reason})")
+            failed_pages.append({"url": e.url, "reason": e.reason})
+            continue  # skip this one book, keep going with the rest
+
         raw = extract_book_record(html, product_url, source_page=source_page)
         normalized = normalize_record(raw)
 
@@ -241,6 +339,7 @@ def main():
                 "raw_record": raw,
             })
 
+    # --- Store --------------------------------------------------------
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     with open(os.path.join(OUTPUT_DIR, "books.json"), "w", encoding="utf-8") as f:
@@ -249,9 +348,30 @@ def main():
     with open(os.path.join(OUTPUT_DIR, "errors.json"), "w", encoding="utf-8") as f:
         json.dump(invalid_records, f, indent=2, ensure_ascii=False)
 
+    # --- Report ---------------------------------------------------------
+    run_finished_at = datetime.now(timezone.utc)
+    duration_seconds = (run_finished_at - run_started_at).total_seconds()
+
+    report = {
+        "started_at": run_started_at.isoformat(),
+        "finished_at": run_finished_at.isoformat(),
+        "duration_seconds": round(duration_seconds, 2),
+        "pages_fetched": pages_fetched,
+        "cache_hits": cache_hits,
+        "valid_records": len(valid_books),
+        "invalid_records": len(invalid_records),
+        "failed_pages": len(failed_pages),
+        "failed_page_details": failed_pages,
+    }
+
+    with open(os.path.join(OUTPUT_DIR, "run-report.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
     print(f"detail_pages={len(link_pairs)}")
     print(f"valid_records={len(valid_books)}")
     print(f"invalid_records={len(invalid_records)}")
+    print(f"failed_pages={len(failed_pages)}")
+    print(f"duration_seconds={report['duration_seconds']}")
 
 
 if __name__ == "__main__":
