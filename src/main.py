@@ -1,10 +1,13 @@
+import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, HttpUrl, ValidationError
 
 # --- Politeness settings -----------------------------------------------
 
@@ -12,10 +15,18 @@ USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/kelashkumar-iba/polit
 TIMEOUT_SECONDS = 10
 DELAY_SECONDS = 0.5
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "cache")
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output")
 
 BASE_CATALOGUE_URL = "https://books.toscrape.com/catalogue/page-1.html"
 MAX_CATALOGUE_PAGES = 3
 
+STAR_WORDS = {"Zero", "One", "Two", "Three", "Four", "Five"}
+STAR_WORD_TO_NUMBER = {"Zero": 0, "One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5}
+
+
+# ---------------------------------------------------------------------------
+# Fetch + cache (unchanged from Stage 3)
+# ---------------------------------------------------------------------------
 
 def fetch_page(url: str, cache_filename: str) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -32,7 +43,6 @@ def fetch_page(url: str, cache_filename: str) -> str:
     response.raise_for_status()
 
     html = response.text
-
     with open(cache_path, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -41,35 +51,29 @@ def fetch_page(url: str, cache_filename: str) -> str:
     return html
 
 
+# ---------------------------------------------------------------------------
+# Discovery (unchanged from Stage 3)
+# ---------------------------------------------------------------------------
+
 def get_book_links(html: str, page_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     links = []
-
     for article in soup.select("article.product_pod"):
         a_tag = article.select_one("h3 a")
         if a_tag and a_tag.get("href"):
-            absolute_url = urljoin(page_url, a_tag["href"])
-            links.append(absolute_url)
-
+            links.append(urljoin(page_url, a_tag["href"]))
     return links
 
 
 def get_next_page_url(html: str, current_url: str) -> str | None:
     soup = BeautifulSoup(html, "html.parser")
     next_li = soup.select_one("li.next a")
-
     if next_li and next_li.get("href"):
         return urljoin(current_url, next_li["href"])
-
     return None
 
 
 def discover_all_book_links() -> list[tuple[str, str]]:
-    """
-    Returns a de-duplicated list of (product_url, source_page) pairs, so
-    every book remembers exactly which catalogue page it was found on --
-    that's part of each record's provenance.
-    """
     all_pairs = []
     current_url = BASE_CATALOGUE_URL
     page_number = 1
@@ -77,49 +81,30 @@ def discover_all_book_links() -> list[tuple[str, str]]:
     while current_url and page_number <= MAX_CATALOGUE_PAGES:
         cache_filename = f"catalogue-page-{page_number}.html"
         html = fetch_page(current_url, cache_filename)
-
         for link in get_book_links(html, current_url):
             all_pairs.append((link, current_url))
-
         current_url = get_next_page_url(html, current_url)
         page_number += 1
 
-    # De-duplicate by product_url while keeping the first source_page seen.
     seen = {}
     for link, source in all_pairs:
         if link not in seen:
             seen[link] = source
-
     return list(seen.items())
 
 
-# ---------------------------------------------------------------------------
-# Stage 3: extract the eight raw fields from a single book detail page.
-# ---------------------------------------------------------------------------
-
-# star-rating class looks like: class="star-rating Three" -- the rating
-# word is the second class, and there's no numeric attribute to read
-# directly, so this word-list is just how the site encodes the number.
-STAR_WORDS = {"Zero", "One", "Two", "Three", "Four", "Five"}
-
-
 def cache_filename_for_book(product_url: str) -> str:
-    """
-    Turns a book's URL into a safe, unique cache filename, e.g.
-    'a-light-in-the-attic_1000' from
-    '.../catalogue/a-light-in-the-attic_1000/index.html'
-    """
     parts = product_url.rstrip("/").split("/")
     slug = parts[-2] if len(parts) >= 2 else parts[-1]
     return f"book-{slug}.html"
 
 
+# ---------------------------------------------------------------------------
+# Raw extraction (unchanged from Stage 3)
+# ---------------------------------------------------------------------------
+
 def extract_book_record(html: str, product_url: str, source_page: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
-
-    # Aim at the product's main info block, not the whole document -- this
-    # is what protects us if the page ever grows a second <h1> or price
-    # somewhere else (related products, ads, etc).
     product_main = soup.select_one("div.product_main")
 
     title = None
@@ -144,15 +129,11 @@ def extract_book_record(html: str, product_url: str, source_page: str) -> dict:
     if product_main:
         rating_el = product_main.select_one("p.star-rating")
         if rating_el:
-            classes = rating_el.get("class", [])
-            for word in classes:
+            for word in rating_el.get("class", []):
                 if word in STAR_WORDS:
                     rating_text = word
                     break
 
-    # Description sits in a <p> right after the #product_description div --
-    # it has no dedicated class of its own, and some books simply don't
-    # have one at all, in which case we store null rather than inventing text.
     description = None
     desc_heading = soup.select_one("#product_description")
     if desc_heading:
@@ -172,6 +153,59 @@ def extract_book_record(html: str, product_url: str, source_page: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Stage 4: normalize raw text into clean values
+# ---------------------------------------------------------------------------
+
+def parse_price_gbp(price_text: str | None) -> float | None:
+    """'£51.77' -> 51.77. Strips the currency symbol and any stray
+    whitespace/encoding artifacts, then parses the number."""
+    if not price_text:
+        return None
+    # Keep only digits and the decimal point.
+    cleaned = re.sub(r"[^\d.]", "", price_text)
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def parse_rating_number(rating_text: str | None) -> int | None:
+    if not rating_text:
+        return None
+    return STAR_WORD_TO_NUMBER.get(rating_text)
+
+
+# ---------------------------------------------------------------------------
+# Schema -- the shape of a finished, storable record.
+# ---------------------------------------------------------------------------
+
+class Book(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    rating_number: int
+    description: str | None
+    source_page: HttpUrl
+    fetched_at: str
+
+
+def normalize_record(raw: dict) -> dict:
+    """Takes a raw extracted record and returns a dict with the clean
+    fields added alongside the original raw text -- both live side by
+    side, nothing is thrown away."""
+    return {
+        **raw,
+        "price_gbp": parse_price_gbp(raw.get("price_text")),
+        "rating_number": parse_rating_number(raw.get("rating_text")),
+    }
+
+
 def main():
     link_pairs = discover_all_book_links()
     urls_only = [url for url, _ in link_pairs]
@@ -179,16 +213,45 @@ def main():
     print(f"discovered={len(urls_only)}")
     print(f"unique_urls={len(set(urls_only))}")
 
-    records = []
+    valid_books = []
+    invalid_records = []
+    seen_canonical_urls = set()
+
     for product_url, source_page in link_pairs:
+        # product_url is already the canonical identity of this record --
+        # skip if we've somehow already processed it (shouldn't happen
+        # given discover_all_book_links() already de-duplicates, but this
+        # is the belt-and-suspenders check that guarantees idempotency).
+        if product_url in seen_canonical_urls:
+            continue
+        seen_canonical_urls.add(product_url)
+
         cache_filename = cache_filename_for_book(product_url)
         html = fetch_page(product_url, cache_filename)
-        record = extract_book_record(html, product_url, source_page=source_page)
-        records.append(record)
+        raw = extract_book_record(html, product_url, source_page=source_page)
+        normalized = normalize_record(raw)
 
-    print(f"detail_pages={len(records)}")
-    print("--- sample record ---")
-    print(records[0])
+        try:
+            book = Book(**normalized)
+            valid_books.append(json.loads(book.model_dump_json()))
+        except ValidationError as e:
+            invalid_records.append({
+                "product_url": product_url,
+                "reason": str(e),
+                "raw_record": raw,
+            })
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    with open(os.path.join(OUTPUT_DIR, "books.json"), "w", encoding="utf-8") as f:
+        json.dump(valid_books, f, indent=2, ensure_ascii=False)
+
+    with open(os.path.join(OUTPUT_DIR, "errors.json"), "w", encoding="utf-8") as f:
+        json.dump(invalid_records, f, indent=2, ensure_ascii=False)
+
+    print(f"detail_pages={len(link_pairs)}")
+    print(f"valid_records={len(valid_books)}")
+    print(f"invalid_records={len(invalid_records)}")
 
 
 if __name__ == "__main__":
